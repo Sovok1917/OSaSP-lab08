@@ -10,7 +10,7 @@
 #define MAX_CMD_LEN 256
 #define MAX_ARGS_LEN (MAX_BUFFER_SIZE - MAX_CMD_LEN - 5) // For ECHO command argument
 
-#define SERVER_DEFAULT_WELCOME_MSG "Вас приветствует учебный сервер 'myserver'\nВерсия 1.0\nРазработчик: C GPT\n"
+#define SERVER_DEFAULT_WELCOME_MSG "Welcome to the test server \'myserver\'"
 
 // Client receive timeout in milliseconds for multi-line responses
 #define CLIENT_RECV_TIMEOUT_MS 200
