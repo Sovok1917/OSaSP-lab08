@@ -111,28 +111,24 @@ int main(int argc, char *argv[]) {
     tv.tv_usec = CLIENT_RECV_TIMEOUT_MS * 1000;
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv) == -1) {
         perror("setsockopt SO_RCVTIMEO for welcome message failed");
-        // Non-fatal, proceed without timeout for welcome, or with default timeout
     }
 
-    // Receive and print multi-line welcome message
-    // Heuristic: welcome message ends when a line contains "Developer:"
     int welcome_received_complete = 0;
     while ((nbytes = recv_line(sockfd, buffer, MAX_BUFFER_SIZE)) > 0) {
-        printf("%s", buffer); // buffer includes newline
-        if (strstr(buffer, "Developer:") != NULL) {
+        printf("%s", buffer);
+        if (strstr(buffer, "Developer:") != NULL) { // Heuristic end of welcome message
             welcome_received_complete = 1;
             break;
         }
     }
-    if (!welcome_received_complete && nbytes <= 0 && nbytes != -2) { // -2 is timeout
+    if (!welcome_received_complete && nbytes <= 0 && nbytes != -2) {
         fprintf(stderr, "Failed to receive complete welcome message or connection closed prematurely.\n");
         close(sockfd);
         if (command_file) fclose(command_file);
-        return (nbytes == 0) ? 0 : 1; // Success if clean EOF, error otherwise
+        return (nbytes == 0) ? 0 : 1;
     }
-    // If nbytes == -2 (timeout), assume welcome message ended.
 
-    char current_prompt_dir[MAX_PATH_LEN] = ""; // For root, prompt is just ">"
+    char current_prompt_dir[MAX_PATH_LEN] = "";
 
     if (command_file) {
         process_commands_from_file(command_file, sockfd, current_prompt_dir);
@@ -173,7 +169,9 @@ static void update_prompt_dir(const char *server_response, char *current_prompt_
     if (strlen(clean_response) == 0 || strcmp(clean_response, "/") == 0) {
         if (prompt_dir_size > 0) current_prompt_dir[0] = '\0';
     } else {
-        snprintf(current_prompt_dir, prompt_dir_size, "%s", clean_response);
+        // Ensure the cleaned response fits into current_prompt_dir
+        strncpy(current_prompt_dir, clean_response, prompt_dir_size - 1);
+        current_prompt_dir[prompt_dir_size - 1] = '\0';
     }
 }
 
@@ -212,7 +210,7 @@ static void process_commands_from_file(FILE *file, int sockfd, char *current_pro
         }
 
         char temp_cmd_check[MAX_CMD_LEN];
-        sscanf(line_buffer, "%s", temp_cmd_check); // Get first word for QUIT check
+        sscanf(line_buffer, "%s", temp_cmd_check);
         if (strcmp(temp_cmd_check, CMD_QUIT) == 0) {
             if ((nbytes_recv = recv_line(sockfd, response_buffer, MAX_BUFFER_SIZE)) > 0) {
                 printf("%s", response_buffer);
@@ -238,7 +236,7 @@ static void process_commands_from_file(FILE *file, int sockfd, char *current_pro
         } else if (nbytes_recv == -1) {
             fprintf(stderr, "Error receiving response from server (file processing line %d).\n", line_count);
             break;
-        } // nbytes_recv == -2 (timeout) means server finished sending for this command.
+        }
         fflush(stdout);
     }
     if (ferror(file)) {
@@ -273,7 +271,6 @@ static void interactive_mode(int sockfd, char *current_prompt_dir) {
                 printf("\nEOF detected on stdin. Sending QUIT command.\n");
                 strncpy(command_buffer, CMD_QUIT, MAX_BUFFER_SIZE -1);
                 command_buffer[MAX_BUFFER_SIZE-1] = '\0';
-                // Fall through to send QUIT
             } else {
                 perror("fgets from stdin failed");
                 break;
@@ -317,8 +314,8 @@ static void interactive_mode(int sockfd, char *current_prompt_dir) {
         } else if (nbytes_recv == -1) {
             fprintf(stderr, "\nError receiving response from server.\n");
             break;
-        } // nbytes_recv == -2 (timeout) means server finished sending.
+        }
         fflush(stdout);
-        if (feof(stdin)) break; // Exit loop if QUIT was sent due to EOF
+        if (feof(stdin)) break;
     }
 }

@@ -49,18 +49,6 @@ static void format_list_item(char *buffer, size_t buf_size, const char *name, co
 /*
  * main
  * Entry point for the server application.
- * Parses command-line arguments for port number and server root directory.
- * Initializes the server socket, binds to the specified port, and listens for
- * incoming client connections. Spawns a new thread for each accepted connection.
- *
- * Parameters:
- *   argc: int - The number of command-line arguments.
- *   argv: char*[] - Array of command-line argument strings.
- *                   Expected: ./myserver <port_no> <root_directory>
- *
- * Returns:
- *   int - 0 on successful termination (though server runs indefinitely),
- *         1 on error during initialization.
  */
 int main(int argc, char *argv[]) {
     initialize_static_memory();
@@ -176,15 +164,6 @@ int main(int argc, char *argv[]) {
 /*
  * client_handler_thread
  * Handles all communication with a single connected client.
- * This function is executed in a separate thread for each client.
- * It receives commands, processes them, and sends responses back to the client.
- *
- * Parameters:
- *   arg: void* - Pointer to a client_thread_data_t structure containing
- *                client-specific information (socket, IP, paths).
- *
- * Returns:
- *   void* - Always NULL. Thread exits using pthread_exit(NULL).
  */
 static void *client_handler_thread(void *arg) {
     client_thread_data_t *data = (client_thread_data_t *)arg;
@@ -261,14 +240,6 @@ static void *client_handler_thread(void *arg) {
 /*
  * log_event
  * Logs a message to standard output, prefixed with a timestamp.
- * This function is variadic, similar to printf.
- *
- * Parameters:
- *   format: const char* - The format string for the log message.
- *   ...: variadic arguments - Arguments for the format string.
- *
- * Returns:
- *   void
  */
 static void log_event(const char *format, ...) {
     char timestamp[64];
@@ -294,17 +265,6 @@ static void log_event(const char *format, ...) {
 /*
  * get_relative_path
  * Converts an absolute path to a path relative to the server's root directory.
- * The returned relative path will always start with '/' (e.g., "/" for root itself,
- * or "/dir/file.txt" for a file within the root).
- *
- * Parameters:
- *   abs_path: const char* - The absolute path to convert.
- *   root_path: const char* - The absolute path of the server's root directory.
- *   rel_path_buf: char* - Buffer to store the resulting relative path.
- *   buf_len: size_t - Size of rel_path_buf.
- *
- * Returns:
- *   char* - Pointer to rel_path_buf on success, or NULL on error.
  */
 static char *get_relative_path(const char *abs_path, const char *root_path, char *rel_path_buf, size_t buf_len) {
     if (rel_path_buf == NULL || buf_len == 0) return NULL;
@@ -331,7 +291,7 @@ static char *get_relative_path(const char *abs_path, const char *root_path, char
     if (rel_path_buf[0] == '\0') {
         if (buf_len < 2) return NULL;
         strcpy(rel_path_buf, "/");
-    } else if (rel_path_buf[0] != '/') { // Should be redundant with current logic but safe
+    } else if (rel_path_buf[0] != '/') {
         if (strlen(rel_path_buf) + 2 > buf_len) return NULL;
         memmove(rel_path_buf + 1, rel_path_buf, strlen(rel_path_buf) + 1);
         rel_path_buf[0] = '/';
@@ -342,19 +302,6 @@ static char *get_relative_path(const char *abs_path, const char *root_path, char
 /*
  * handle_cd
  * Processes the CD (Change Directory) command from a client.
- * Changes the client's current working directory on the server, restricted
- * to the server's root directory and its subdirectories.
- * If the target path is invalid, outside the root, or not a directory,
- * the command is silently ignored as per specification.
- *
- * Parameters:
- *   data: client_thread_data_t* - Client-specific data.
- *   path_arg: const char* - The directory argument provided with the CD command.
- *   response_buffer: char* - Buffer to store the server's response.
- *   response_max_len: size_t - Maximum length of the response buffer.
- *
- * Returns:
- *   void
  */
 static void handle_cd(client_thread_data_t *data, const char *path_arg, char *response_buffer, size_t response_max_len) {
     if (response_buffer == NULL || response_max_len == 0) return;
@@ -363,23 +310,59 @@ static void handle_cd(client_thread_data_t *data, const char *path_arg, char *re
     if (path_arg == NULL || strlen(path_arg) == 0) return;
 
     char target_path_trial[MAX_PATH_LEN];
-    size_t len_root = strlen(data->server_root_abs);
+    target_path_trial[0] = '\0'; // Initialize for safety
+    size_t len_current_root = strlen(data->server_root_abs);
     size_t len_cwd = strlen(data->current_wd_abs);
     size_t len_arg = strlen(path_arg);
 
-    if (path_arg[0] == '/') {
-        const char *actual_path_segment = path_arg;
-        if (strcmp(data->server_root_abs, "/") == 0 && strcmp(path_arg, "/") == 0) actual_path_segment = "";
-        if (len_root + strlen(actual_path_segment) + 1 > MAX_PATH_LEN) return;
-        snprintf(target_path_trial, MAX_PATH_LEN, "%s%s", data->server_root_abs, actual_path_segment);
-    } else {
-        if (len_cwd + 1 + len_arg + 1 > MAX_PATH_LEN) return;
+    if (path_arg[0] == '/') { // Absolute path from server root
+        const char *segment_to_use = path_arg;
+
+        // Case 1: Server root is "/"
+        if (strcmp(data->server_root_abs, "/") == 0) {
+            // If path_arg is also just "/", target is "/"
+            // If path_arg is "/foo", target is "/foo"
+            if (len_arg + 1 > MAX_PATH_LEN) return; // path_arg + '\0'
+            strcpy(target_path_trial, segment_to_use);
+        }
+        // Case 2: Server root is "/base"
+        else {
+            // If path_arg is "/", target is server_root_abs ("/base")
+            if (strcmp(segment_to_use, "/") == 0) {
+                if (len_current_root + 1 > MAX_PATH_LEN) return;
+                strcpy(target_path_trial, data->server_root_abs);
+            }
+            // If path_arg is "/foo", target is server_root_abs + path_arg ("/base/foo")
+            else {
+                if (len_current_root + len_arg + 1 > MAX_PATH_LEN) return; // server_root/arg\0
+                strcpy(target_path_trial, data->server_root_abs);
+                // Ensure we don't add a double slash if server_root_abs ends with one (it shouldn't from realpath)
+                // and path_arg starts with one. Realpath will clean this up later.
+                strcat(target_path_trial, segment_to_use);
+            }
+        }
+    } else { // Relative path
+        if (len_cwd + 1 + len_arg + 1 > MAX_PATH_LEN) return; // cwd + '/' + arg + '\0'
         strcpy(target_path_trial, data->current_wd_abs);
+        // Append '/' if current_wd_abs is not "/" and does not already end with '/'
         if (strcmp(data->current_wd_abs, "/") != 0) {
-            if (len_cwd > 0 && data->current_wd_abs[len_cwd - 1] != '/') strcat(target_path_trial, "/");
+            if (len_cwd > 0 && data->current_wd_abs[len_cwd - 1] != '/') {
+                strcat(target_path_trial, "/");
+            }
+        } else if (len_cwd == 1 && data->current_wd_abs[0] == '/') {
+            // current_wd_abs is just "/", target_path_trial is currently "/"
+            // If path_arg is "foo", strcat makes "/foo".
+            // If path_arg is "/foo" (not expected for relative), strcat makes "//foo".
+            // The path_arg for relative CD should not start with '/'.
         }
         strcat(target_path_trial, path_arg);
     }
+
+    if (target_path_trial[0] == '\0' && strcmp(data->server_root_abs, "/") == 0 && strcmp(path_arg, "/") == 0) {
+        // Special case: CD / when root is /
+        strcpy(target_path_trial, "/");
+    }
+
 
     char resolved_path[MAX_PATH_LEN];
     if (realpath(target_path_trial, resolved_path) == NULL) return;
@@ -387,11 +370,9 @@ static void handle_cd(client_thread_data_t *data, const char *path_arg, char *re
     struct stat st;
     if (stat(resolved_path, &st) != 0 || !S_ISDIR(st.st_mode)) return;
 
-    size_t current_root_len = strlen(data->server_root_abs);
     size_t resolved_len = strlen(resolved_path);
-
-    if (resolved_len < current_root_len || strncmp(resolved_path, data->server_root_abs, current_root_len) != 0) return;
-    if (resolved_len > current_root_len && resolved_path[current_root_len] != '/') {
+    if (resolved_len < len_current_root || strncmp(resolved_path, data->server_root_abs, len_current_root) != 0) return;
+    if (resolved_len > len_current_root && resolved_path[len_current_root] != '/') {
         if (strcmp(data->server_root_abs, "/") != 0) return;
     }
 
@@ -422,17 +403,6 @@ static void handle_cd(client_thread_data_t *data, const char *path_arg, char *re
 /*
  * format_list_item
  * Safely formats a single line for the LIST command output.
- *
- * Parameters:
- *   buffer: char* - The output buffer for the formatted line.
- *   buf_size: size_t - The size of the output buffer.
- *   name: const char* - The name of the file system entry.
- *   middle: const char* - The separator string (e.g., " --> ", " -->> ", NULL).
- *   target: const char* - The target path for symlinks (or NULL).
- *   suffix: const char* - The suffix for the entry (e.g., "/" for dirs, "\n" for files).
- *
- * Returns:
- *   void
  */
 static void format_list_item(char *buffer, size_t buf_size, const char *name, const char *middle, const char *target, const char *suffix) {
     if (buffer == NULL || buf_size == 0) return;
@@ -442,39 +412,71 @@ static void format_list_item(char *buffer, size_t buf_size, const char *name, co
     strncpy(truncated_name, name, NAME_MAX);
     truncated_name[NAME_MAX] = '\0';
 
+    const char *actual_middle = middle ? middle : "";
+    const char *actual_suffix = suffix ? suffix : "";
+    const char *actual_target = target ? target : "";
+
     size_t name_len = strlen(truncated_name);
-    size_t middle_len = middle ? strlen(middle) : 0;
-    size_t suffix_len = suffix ? strlen(suffix) : 0;
-    size_t fixed_parts_len = name_len + middle_len + suffix_len;
+    size_t middle_len = strlen(actual_middle);
+    size_t suffix_len = strlen(actual_suffix);
+    size_t target_len = strlen(actual_target);
 
-    if (buf_size <= fixed_parts_len) {
-        if (buf_size > name_len + suffix_len) snprintf(buffer, buf_size, "%s%s", truncated_name, suffix ? suffix : "");
-        return;
+    size_t current_pos = 0;
+    size_t space_needed;
+
+    // Try to append name
+    space_needed = name_len;
+    if (current_pos + space_needed < buf_size) {
+        strcpy(buffer + current_pos, truncated_name);
+        current_pos += space_needed;
+    } else { goto end_format; } // Not enough space even for name
+
+    // Try to append middle (only if target is also to be appended)
+    if (middle && target) {
+        space_needed = middle_len;
+        if (current_pos + space_needed < buf_size) {
+            strcpy(buffer + current_pos, actual_middle);
+            current_pos += space_needed;
+        } else { goto append_suffix_only; } // No space for middle, skip target, try suffix
     }
 
-    int available_for_target = 0;
-    if (target && middle) {
-        available_for_target = buf_size - 1 - fixed_parts_len;
-        if(available_for_target < 0) available_for_target = 0;
+    // Try to append target (only if middle was appended)
+    if (middle && target) {
+        // Calculate remaining space for target, considering suffix and null terminator
+        size_t space_for_target = 0;
+        if (buf_size > current_pos + suffix_len + 1) { // +1 for null terminator
+            space_for_target = buf_size - current_pos - suffix_len - 1;
+        }
+
+        if (target_len <= space_for_target) {
+            strcpy(buffer + current_pos, actual_target);
+            current_pos += target_len;
+        } else if (space_for_target > 0) { // Truncate target
+            strncpy(buffer + current_pos, actual_target, space_for_target);
+            current_pos += space_for_target;
+            buffer[current_pos] = '\0'; // strncpy might not null terminate
+        }
+        // If no space for target (space_for_target is 0), it's skipped.
     }
 
-    if (target && middle) snprintf(buffer, buf_size, "%s%s%.*s%s", truncated_name, middle, available_for_target, target, suffix ? suffix : "");
-    else if (middle) snprintf(buffer, buf_size, "%s%s%s", truncated_name, middle, suffix ? suffix : "");
-    else snprintf(buffer, buf_size, "%s%s", truncated_name, suffix ? suffix : "");
+    append_suffix_only:
+    // Try to append suffix
+    space_needed = suffix_len;
+    if (current_pos + space_needed < buf_size) {
+        strcpy(buffer + current_pos, actual_suffix);
+        current_pos += space_needed; // Not strictly needed as it's the last part
+    } else if (buf_size > current_pos && buf_size > 0) {
+        buffer[current_pos] = '\0'; // Ensure null termination if suffix doesn't fit
+    }
+
+    end_format:
+    if (buf_size > 0) buffer[buf_size - 1] = '\0'; // Final safety net for null termination
 }
+
 
 /*
  * handle_list
  * Processes the LIST command from a client.
- * Reads the contents of the client's current working directory on the server
- * and sends a formatted list of entries back to the client.
- *
- * Parameters:
- *   data: client_thread_data_t* - Client-specific data.
- *   client_sockfd: int - The client's socket file descriptor.
- *
- * Returns:
- *   void
  */
 static void handle_list(client_thread_data_t *data, int client_sockfd) {
     DIR *dirp;
@@ -574,12 +576,16 @@ static void handle_list(client_thread_data_t *data, int client_sockfd) {
                         goto send_current_item_response;
                     }
                     strcpy(first_target_abs_path, link_dir);
-                    if (strcmp(link_dir, "/") != 0) {
+                    if (strcmp(link_dir, "/") != 0) { // Avoid "//" if link_dir is "/"
                         if (len_link_dir > 0 && link_dir[len_link_dir - 1] != '/') strcat(first_target_abs_path, "/");
                     }
+                    // Avoid double slash if first_target_abs_path is "/" and target_buf also starts with "/"
                     if (first_target_abs_path[strlen(first_target_abs_path)-1] == '/' && target_buf[0] == '/') {
                         if (strlen(target_buf) > 1) strcat(first_target_abs_path, target_buf + 1);
-                    } else if (target_buf[0] != '\0') strcat(first_target_abs_path, target_buf);
+                        // else if target_buf is just "/", first_target_abs_path remains "/"
+                    } else if (target_buf[0] != '\0') { // Avoid appending empty target_buf
+                        strcat(first_target_abs_path, target_buf);
+                    }
                 }
 
                 struct stat first_target_st; int is_intermediate_link = 0; errno = 0;

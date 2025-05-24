@@ -47,7 +47,6 @@ CMakeFiles/
 CMakeCache.txt
 *.cmake
 cmake_install.cmake
-Makefile
 
 # Ignore auto-generated makefiles and config headers
 Makefile.in
