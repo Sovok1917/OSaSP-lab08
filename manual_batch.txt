@@ -1,0 +1,14 @@
+INFO
+ECHO Batch mode test
+LIST
+CD dir_A
+ECHO Now in dir_A
+LIST
+CD /dir_B/sub_B
+ECHO Now in sub_B
+LIST
+CD /
+ECHO Back to root
+CD non_existent_batch
+LIST
+QUIT
