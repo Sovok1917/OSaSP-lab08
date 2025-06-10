@@ -18,25 +18,25 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <netdb.h>
-#include <sys/select.h> // Required for select()
+#include <errno.h>
+#include <sys/time.h> // For timeval in setsockopt
+#include <signal.h>   // For signal handling
 
 #define BUFFER_SIZE 1024
 
-// Global flag for signal handler to ensure safe termination.
-volatile sig_atomic_t g_interrupted = 0;
+// --- Global variables for graceful shutdown ---
+static volatile sig_atomic_t g_shutdown_flag = 0;
+// ---
+
+// Function prototypes
+static void process_commands_from_file(FILE *file, int sockfd, char *current_prompt_dir);
+static void interactive_mode(int sockfd, char *current_prompt_dir);
+static void update_prompt_dir(const char *server_response, char *current_prompt_dir, size_t prompt_dir_size);
+static void signal_handler(int signum);
 
 /*
  * main
- * The main entry point for the client application. It handles command-line
- * arguments, connects to the server, and manages the main I/O loop.
- *
- * parameters:
- *   argc - The number of command-line arguments.
- *   argv - An array of command-line argument strings.
- *
- * return value:
- *   Returns 0 on successful execution, 1 on error.
+ * Entry point for the client application.
  */
 int main(int argc, char *argv[]);
 
@@ -62,6 +62,23 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Usage: %s <server_ip> <port>\n", argv[0]);
         return 1;
     }
+
+    // --- Setup Signal Handlers ---
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; // Do not restart syscalls like fgets()
+
+    if (sigaction(SIGINT, &sa, NULL) == -1) {
+        perror("sigaction for SIGINT failed");
+        return 1;
+    }
+    if (sigaction(SIGTERM, &sa, NULL) == -1) {
+        perror("sigaction for SIGTERM failed");
+        return 1;
+    }
+    // ---
 
     const char *server_ip = argv[1];
     int port = atoi(argv[2]);
@@ -137,10 +154,88 @@ int main(int argc, char *argv[]) {
         // Block here until stdin has data or a signal is caught
         int activity = select(STDIN_FILENO + 1, &read_fds, NULL, NULL, NULL);
 
-        if (activity < 0) {
-            if (errno == EINTR) {
-                // Interrupted by our SIGINT handler. The loop will now terminate.
-                continue;
+    if (g_shutdown_flag) {
+        fprintf(stdout, "\nShutdown signal caught. Notifying server...\n");
+        char quit_cmd[MAX_CMD_LEN];
+        snprintf(quit_cmd, sizeof(quit_cmd), "%s\n", CMD_QUIT);
+        if (send_all(sockfd, quit_cmd, strlen(quit_cmd)) == -1) {
+            fprintf(stderr, "Warning: Failed to send QUIT command to server during shutdown.\n");
+        }
+    }
+
+    if (close(sockfd) == -1) {
+        perror("close sockfd failed");
+    }
+    return 0;
+}
+
+/*
+ * signal_handler
+ * Catches SIGINT and SIGTERM to allow for a graceful shutdown.
+ * This handler is async-signal-safe.
+ *
+ * Parameters:
+ *   signum: int - The signal number that was caught.
+ *
+ * Returns:
+ *   void
+ */
+static void signal_handler(int signum) {
+    if (signum == SIGINT || signum == SIGTERM) {
+        g_shutdown_flag = 1;
+    }
+}
+
+/*
+ * update_prompt_dir
+ * Updates the client's current directory string for the command prompt.
+ */
+static void update_prompt_dir(const char *server_response, char *current_prompt_dir, size_t prompt_dir_size) {
+    if (current_prompt_dir == NULL || prompt_dir_size == 0) return;
+
+    char clean_response[MAX_PATH_LEN];
+    strncpy(clean_response, server_response, MAX_PATH_LEN -1);
+    clean_response[MAX_PATH_LEN-1] = '\0';
+    clean_response[strcspn(clean_response, "\r\n")] = 0;
+
+    if (strlen(clean_response) == 0 || strcmp(clean_response, "/") == 0) {
+        if (prompt_dir_size > 0) current_prompt_dir[0] = '\0';
+    } else {
+        strncpy(current_prompt_dir, clean_response, prompt_dir_size - 1);
+        current_prompt_dir[prompt_dir_size - 1] = '\0';
+    }
+}
+
+/*
+ * process_commands_from_file
+ * Reads commands from a file, sends them to the server, and prints responses.
+ */
+static void process_commands_from_file(FILE *file, int sockfd, char *current_prompt_dir) {
+    char line_buffer[MAX_BUFFER_SIZE];
+    char response_buffer[MAX_BUFFER_SIZE];
+    ssize_t nbytes_recv;
+    int line_count = 0;
+
+    while (!g_shutdown_flag && fgets(line_buffer, sizeof(line_buffer), file) != NULL) {
+        line_count++;
+        line_buffer[strcspn(line_buffer, "\r\n")] = 0;
+
+        if (strlen(line_buffer) == 0 && !feof(file)) continue;
+
+        if (strlen(current_prompt_dir) == 0) printf("> %s\n", line_buffer);
+        else printf("%s> %s\n", current_prompt_dir, line_buffer);
+        fflush(stdout);
+
+        if (send_all(sockfd, line_buffer, strlen(line_buffer)) == -1 || send_all(sockfd, "\n", 1) == -1) {
+            fprintf(stderr, "Error sending command/newline from file (line %d): %s\n", line_count, line_buffer);
+            break;
+        }
+
+        char temp_cmd_check[MAX_CMD_LEN];
+        sscanf(line_buffer, "%s", temp_cmd_check);
+        if (strcmp(temp_cmd_check, CMD_QUIT) == 0) {
+            if ((nbytes_recv = recv_line(sockfd, response_buffer, MAX_BUFFER_SIZE)) > 0) {
+                printf("%s", response_buffer);
             }
             perror("select failed");
             break;
@@ -153,13 +248,70 @@ int main(int argc, char *argv[]) {
                 } else if (ferror(stdin) && !g_interrupted) {
                     perror("fgets failed");
                 }
+                first_line_after_cd = 0;
+            }
+        }
+        if (nbytes_recv == 0) {
+            fprintf(stderr, "Server closed connection unexpectedly (file processing line %d).\n", line_count);
+            break;
+        } else if (nbytes_recv == -1) {
+            fprintf(stderr, "Error receiving response from server (file processing line %d).\n", line_count);
+            break;
+        }
+        fflush(stdout);
+    }
+    if (ferror(file)) {
+        perror("Error reading from command file");
+    }
+    if (g_shutdown_flag) {
+        fprintf(stderr, "\nShutdown signal received during file processing. Aborting.\n");
+    }
+}
+
+/*
+ * interactive_mode
+ * Handles interactive command input from the user via stdin.
+ */
+static void interactive_mode(int sockfd, char *current_prompt_dir) {
+    char command_buffer[MAX_BUFFER_SIZE];
+    char response_buffer[MAX_BUFFER_SIZE];
+    ssize_t nbytes_recv;
+
+    while (!g_shutdown_flag) {
+        if (strlen(current_prompt_dir) == 0) printf("> ");
+        else printf("%s> ", current_prompt_dir);
+        fflush(stdout);
+
+        if (fgets(command_buffer, sizeof(command_buffer), stdin) == NULL) {
+            if (g_shutdown_flag) {
+                // Signal was caught, loop will terminate.
+                break;
+            }
+            if (feof(stdin)) {
+                printf("\nEOF detected on stdin. Sending QUIT command.\n");
+                strncpy(command_buffer, CMD_QUIT, sizeof(command_buffer) -1);
+                command_buffer[sizeof(command_buffer)-1] = '\0';
+            } else if (errno == EINTR) {
+                // Interrupted by a signal, clear error and continue loop
+                clearerr(stdin);
+                continue;
+            } else {
+                perror("fgets from stdin failed");
                 break;
             }
 
             input_buffer[strcspn(input_buffer, "\n")] = '\0';
 
-            if (strcmp(input_buffer, "quit") == 0 || strcmp(input_buffer, "exit") == 0) {
-                break;
+        if (send_all(sockfd, command_buffer, strlen(command_buffer)) == -1 || send_all(sockfd, "\n", 1) == -1) {
+            fprintf(stderr, "Error sending command/newline: %s\n", command_buffer);
+            break;
+        }
+
+        char temp_cmd_check[MAX_CMD_LEN];
+        sscanf(command_buffer, "%s", temp_cmd_check);
+        if (strcmp(temp_cmd_check, CMD_QUIT) == 0) {
+            if ((nbytes_recv = recv_line(sockfd, response_buffer, MAX_BUFFER_SIZE)) > 0) {
+                printf("%s", response_buffer);
             }
 
             if (send(sock_fd, input_buffer, strlen(input_buffer), 0) == -1) {
