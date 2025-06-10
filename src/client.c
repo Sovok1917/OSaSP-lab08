@@ -14,29 +14,24 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <sys/time.h> // For timeval in setsockopt
+#include <signal.h>   // For signal handling
 
 #include "common.h"
 #include "protocol.h"
+
+// --- Global variables for graceful shutdown ---
+static volatile sig_atomic_t g_shutdown_flag = 0;
+// ---
 
 // Function prototypes
 static void process_commands_from_file(FILE *file, int sockfd, char *current_prompt_dir);
 static void interactive_mode(int sockfd, char *current_prompt_dir);
 static void update_prompt_dir(const char *server_response, char *current_prompt_dir, size_t prompt_dir_size);
+static void signal_handler(int signum);
 
 /*
  * main
  * Entry point for the client application.
- * Parses command-line arguments for server address, port number, and an optional
- * command file. Connects to the server and enters command processing mode
- * (either interactive or batch).
- *
- * Parameters:
- *   argc: int - The number of command-line arguments.
- *   argv: char*[] - Array of command-line argument strings.
- *                   Expected: ./myclient <server_address> <port_number> [@command_file]
- *
- * Returns:
- *   int - 0 on successful completion, 1 on error.
  */
 int main(int argc, char *argv[]) {
     initialize_static_memory();
@@ -45,6 +40,23 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Usage: %s <server_address> <port_number> [@command_file]\n", argv[0]);
         return 1;
     }
+
+    // --- Setup Signal Handlers ---
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; // Do not restart syscalls like fgets()
+
+    if (sigaction(SIGINT, &sa, NULL) == -1) {
+        perror("sigaction for SIGINT failed");
+        return 1;
+    }
+    if (sigaction(SIGTERM, &sa, NULL) == -1) {
+        perror("sigaction for SIGTERM failed");
+        return 1;
+    }
+    // ---
 
     const char *server_ip = argv[1];
     char *endptr;
@@ -139,6 +151,15 @@ int main(int argc, char *argv[]) {
         interactive_mode(sockfd, current_prompt_dir);
     }
 
+    if (g_shutdown_flag) {
+        fprintf(stdout, "\nShutdown signal caught. Notifying server...\n");
+        char quit_cmd[MAX_CMD_LEN];
+        snprintf(quit_cmd, sizeof(quit_cmd), "%s\n", CMD_QUIT);
+        if (send_all(sockfd, quit_cmd, strlen(quit_cmd)) == -1) {
+            fprintf(stderr, "Warning: Failed to send QUIT command to server during shutdown.\n");
+        }
+    }
+
     if (close(sockfd) == -1) {
         perror("close sockfd failed");
     }
@@ -146,17 +167,25 @@ int main(int argc, char *argv[]) {
 }
 
 /*
- * update_prompt_dir
- * Updates the client's current directory string for the command prompt based
- * on the server's response to a CD command.
+ * signal_handler
+ * Catches SIGINT and SIGTERM to allow for a graceful shutdown.
+ * This handler is async-signal-safe.
  *
  * Parameters:
- *   server_response: const char* - The line received from the server (new relative path).
- *   current_prompt_dir: char* - Buffer to store the directory string for the prompt.
- *   prompt_dir_size: size_t - Size of the current_prompt_dir buffer.
+ *   signum: int - The signal number that was caught.
  *
  * Returns:
  *   void
+ */
+static void signal_handler(int signum) {
+    if (signum == SIGINT || signum == SIGTERM) {
+        g_shutdown_flag = 1;
+    }
+}
+
+/*
+ * update_prompt_dir
+ * Updates the client's current directory string for the command prompt.
  */
 static void update_prompt_dir(const char *server_response, char *current_prompt_dir, size_t prompt_dir_size) {
     if (current_prompt_dir == NULL || prompt_dir_size == 0) return;
@@ -169,7 +198,6 @@ static void update_prompt_dir(const char *server_response, char *current_prompt_
     if (strlen(clean_response) == 0 || strcmp(clean_response, "/") == 0) {
         if (prompt_dir_size > 0) current_prompt_dir[0] = '\0';
     } else {
-        // Ensure the cleaned response fits into current_prompt_dir
         strncpy(current_prompt_dir, clean_response, prompt_dir_size - 1);
         current_prompt_dir[prompt_dir_size - 1] = '\0';
     }
@@ -177,16 +205,7 @@ static void update_prompt_dir(const char *server_response, char *current_prompt_
 
 /*
  * process_commands_from_file
- * Reads commands from an opened file stream, sends them to the server,
- * and prints server responses.
- *
- * Parameters:
- *   file: FILE* - The opened file stream containing commands.
- *   sockfd: int - The connected socket file descriptor to the server.
- *   current_prompt_dir: char* - String representing the current directory for the prompt.
- *
- * Returns:
- *   void
+ * Reads commands from a file, sends them to the server, and prints responses.
  */
 static void process_commands_from_file(FILE *file, int sockfd, char *current_prompt_dir) {
     char line_buffer[MAX_BUFFER_SIZE];
@@ -194,7 +213,7 @@ static void process_commands_from_file(FILE *file, int sockfd, char *current_pro
     ssize_t nbytes_recv;
     int line_count = 0;
 
-    while (fgets(line_buffer, sizeof(line_buffer), file) != NULL) {
+    while (!g_shutdown_flag && fgets(line_buffer, sizeof(line_buffer), file) != NULL) {
         line_count++;
         line_buffer[strcspn(line_buffer, "\r\n")] = 0;
 
@@ -242,35 +261,38 @@ static void process_commands_from_file(FILE *file, int sockfd, char *current_pro
     if (ferror(file)) {
         perror("Error reading from command file");
     }
+    if (g_shutdown_flag) {
+        fprintf(stderr, "\nShutdown signal received during file processing. Aborting.\n");
+    }
 }
 
 /*
  * interactive_mode
- * Handles interactive command input from the user via stdin, sends commands
- * to the server, and prints server responses.
- *
- * Parameters:
- *   sockfd: int - The connected socket file descriptor to the server.
- *   current_prompt_dir: char* - String representing the current directory for the prompt.
- *
- * Returns:
- *   void
+ * Handles interactive command input from the user via stdin.
  */
 static void interactive_mode(int sockfd, char *current_prompt_dir) {
     char command_buffer[MAX_BUFFER_SIZE];
     char response_buffer[MAX_BUFFER_SIZE];
     ssize_t nbytes_recv;
 
-    while (1) {
+    while (!g_shutdown_flag) {
         if (strlen(current_prompt_dir) == 0) printf("> ");
         else printf("%s> ", current_prompt_dir);
         fflush(stdout);
 
         if (fgets(command_buffer, sizeof(command_buffer), stdin) == NULL) {
+            if (g_shutdown_flag) {
+                // Signal was caught, loop will terminate.
+                break;
+            }
             if (feof(stdin)) {
                 printf("\nEOF detected on stdin. Sending QUIT command.\n");
-                strncpy(command_buffer, CMD_QUIT, MAX_BUFFER_SIZE -1);
-                command_buffer[MAX_BUFFER_SIZE-1] = '\0';
+                strncpy(command_buffer, CMD_QUIT, sizeof(command_buffer) -1);
+                command_buffer[sizeof(command_buffer)-1] = '\0';
+            } else if (errno == EINTR) {
+                // Interrupted by a signal, clear error and continue loop
+                clearerr(stdin);
+                continue;
             } else {
                 perror("fgets from stdin failed");
                 break;
@@ -279,7 +301,6 @@ static void interactive_mode(int sockfd, char *current_prompt_dir) {
 
         command_buffer[strcspn(command_buffer, "\r\n")] = 0;
         if (strlen(command_buffer) == 0 && !feof(stdin)) continue;
-
 
         if (send_all(sockfd, command_buffer, strlen(command_buffer)) == -1 || send_all(sockfd, "\n", 1) == -1) {
             fprintf(stderr, "Error sending command/newline: %s\n", command_buffer);

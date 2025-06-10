@@ -21,6 +21,7 @@
 #include <dirent.h>
 #include <libgen.h>
 #include <stdarg.h>
+#include <signal.h> // For signal handling
 
 #include "common.h"
 #include "protocol.h"
@@ -37,7 +38,11 @@ typedef struct client_thread_data_s {
     char current_wd_abs[MAX_PATH_LEN];
 } client_thread_data_t;
 
+// --- Global variables for graceful shutdown ---
+static volatile sig_atomic_t g_shutdown_flag = 0;
+static int g_server_sockfd = -1;
 static char server_root_global[MAX_PATH_LEN];
+// ---
 
 static void *client_handler_thread(void *arg);
 static void log_event(const char *format, ...);
@@ -45,6 +50,7 @@ static void handle_cd(client_thread_data_t *data, const char *path_arg, char *re
 static void handle_list(client_thread_data_t *data, int client_sockfd);
 static char *get_relative_path(const char *abs_path, const char *root_path, char *rel_path_buf, size_t buf_len);
 static void format_list_item(char *buffer, size_t buf_size, const char *name, const char *middle, const char *target, const char *suffix);
+static void signal_handler(int signum);
 
 /*
  * main
@@ -57,6 +63,23 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Usage: %s <port_no> <root_directory>\n", argv[0]);
         return 1;
     }
+
+    // --- Setup Signal Handlers ---
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; // Do not restart syscalls like accept()
+
+    if (sigaction(SIGINT, &sa, NULL) == -1) {
+        perror("sigaction for SIGINT failed");
+        return 1;
+    }
+    if (sigaction(SIGTERM, &sa, NULL) == -1) {
+        perror("sigaction for SIGTERM failed");
+        return 1;
+    }
+    // ---
 
     char *endptr;
     long port_long = strtol(argv[1], &endptr, 10);
@@ -83,20 +106,19 @@ int main(int argc, char *argv[]) {
     }
     log_event("Server root set to: %s", server_root_global);
 
-    int server_sockfd;
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
 
-    server_sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_sockfd == -1) {
+    g_server_sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (g_server_sockfd == -1) {
         perror("socket creation failed");
         return 1;
     }
 
     int optval = 1;
-    if (setsockopt(server_sockfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1) {
+    if (setsockopt(g_server_sockfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1) {
         perror("setsockopt SO_REUSEADDR failed");
-        close(server_sockfd);
+        close(g_server_sockfd);
         return 1;
     }
 
@@ -105,23 +127,26 @@ int main(int argc, char *argv[]) {
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(port);
 
-    if (bind(server_sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
+    if (bind(g_server_sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
         perror("bind failed");
-        close(server_sockfd);
+        close(g_server_sockfd);
         return 1;
     }
 
-    if (listen(server_sockfd, 10) == -1) {
+    if (listen(g_server_sockfd, 10) == -1) {
         perror("listen failed");
-        close(server_sockfd);
+        close(g_server_sockfd);
         return 1;
     }
 
     log_event("Ready. Listening on port %u", port);
 
-    while (1) {
-        int client_sockfd = accept(server_sockfd, (struct sockaddr *)&client_addr, &client_addr_len);
+    while (!g_shutdown_flag) {
+        int client_sockfd = accept(g_server_sockfd, (struct sockaddr *)&client_addr, &client_addr_len);
         if (client_sockfd == -1) {
+            if (errno == EINTR && g_shutdown_flag) {
+                break;
+            }
             if (errno == EINTR) continue;
             perror("accept failed");
             continue;
@@ -156,9 +181,20 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (close(server_sockfd) == -1) perror("close server_sockfd failed");
-    log_event("Server shutting down.");
+    log_event("Shutdown signal received. Closing listener socket.");
+    if (close(g_server_sockfd) == -1) perror("close server_sockfd failed");
+    log_event("Server shut down.");
     return 0;
+}
+
+/*
+ * signal_handler
+ * Catches SIGINT and SIGTERM to allow for a graceful shutdown.
+ */
+static void signal_handler(int signum) {
+    if (signum == SIGINT || signum == SIGTERM) {
+        g_shutdown_flag = 1;
+    }
 }
 
 /*
@@ -198,8 +234,7 @@ static void *client_handler_thread(void *arg) {
             log_event("Client %s:%d initiated QUIT. Closing connection.", data->client_ip, data->client_port);
             break;
         } else if (strcmp(command, CMD_INFO) == 0) {
-            strncpy(response, SERVER_DEFAULT_WELCOME_MSG, MAX_BUFFER_SIZE - 1);
-            response[MAX_BUFFER_SIZE - 1] = '\0';
+            snprintf(response, MAX_BUFFER_SIZE, "%s", SERVER_DEFAULT_WELCOME_MSG);
         } else if (strcmp(command, CMD_CD) == 0) {
             handle_cd(data, cmd_arg, response, MAX_BUFFER_SIZE);
         } else if (strcmp(command, CMD_LIST) == 0) {
@@ -307,172 +342,118 @@ static void handle_cd(client_thread_data_t *data, const char *path_arg, char *re
     if (response_buffer == NULL || response_max_len == 0) return;
     response_buffer[0] = '\0';
 
-    if (path_arg == NULL || strlen(path_arg) == 0) return;
+    if (path_arg == NULL || strlen(path_arg) == 0) {
+        snprintf(response_buffer, response_max_len, "%sCD: Missing argument\n", RESP_ERROR_PREFIX);
+        return;
+    }
 
     char target_path_trial[MAX_PATH_LEN];
-    target_path_trial[0] = '\0'; // Initialize for safety
-    size_t len_current_root = strlen(data->server_root_abs);
-    size_t len_cwd = strlen(data->current_wd_abs);
-    size_t len_arg = strlen(path_arg);
 
     if (path_arg[0] == '/') { // Absolute path from server root
-        const char *segment_to_use = path_arg;
+        const char *effective_path_arg = (strcmp(path_arg, "/") == 0) ? "" : path_arg;
+        size_t root_len = strlen(data->server_root_abs);
+        size_t arg_len = strlen(effective_path_arg);
 
-        // Case 1: Server root is "/"
-        if (strcmp(data->server_root_abs, "/") == 0) {
-            // If path_arg is also just "/", target is "/"
-            // If path_arg is "/foo", target is "/foo"
-            if (len_arg + 1 > MAX_PATH_LEN) return; // path_arg + '\0'
-            strcpy(target_path_trial, segment_to_use);
+        if (root_len + arg_len + 1 > sizeof(target_path_trial)) {
+            snprintf(response_buffer, response_max_len, "%sCD: Resulting path is too long\n", RESP_ERROR_PREFIX);
+            return;
         }
-        // Case 2: Server root is "/base"
-        else {
-            // If path_arg is "/", target is server_root_abs ("/base")
-            if (strcmp(segment_to_use, "/") == 0) {
-                if (len_current_root + 1 > MAX_PATH_LEN) return;
-                strcpy(target_path_trial, data->server_root_abs);
-            }
-            // If path_arg is "/foo", target is server_root_abs + path_arg ("/base/foo")
-            else {
-                if (len_current_root + len_arg + 1 > MAX_PATH_LEN) return; // server_root/arg\0
-                strcpy(target_path_trial, data->server_root_abs);
-                // Ensure we don't add a double slash if server_root_abs ends with one (it shouldn't from realpath)
-                // and path_arg starts with one. Realpath will clean this up later.
-                strcat(target_path_trial, segment_to_use);
-            }
-        }
+        strcpy(target_path_trial, data->server_root_abs);
+        strcat(target_path_trial, effective_path_arg);
     } else { // Relative path
-        if (len_cwd + 1 + len_arg + 1 > MAX_PATH_LEN) return; // cwd + '/' + arg + '\0'
-        strcpy(target_path_trial, data->current_wd_abs);
-        // Append '/' if current_wd_abs is not "/" and does not already end with '/'
-        if (strcmp(data->current_wd_abs, "/") != 0) {
-            if (len_cwd > 0 && data->current_wd_abs[len_cwd - 1] != '/') {
-                strcat(target_path_trial, "/");
-            }
-        } else if (len_cwd == 1 && data->current_wd_abs[0] == '/') {
-            // current_wd_abs is just "/", target_path_trial is currently "/"
-            // If path_arg is "foo", strcat makes "/foo".
-            // If path_arg is "/foo" (not expected for relative), strcat makes "//foo".
-            // The path_arg for relative CD should not start with '/'.
+        size_t cwd_len = strlen(data->current_wd_abs);
+        size_t arg_len = strlen(path_arg);
+        if (cwd_len + 1 + arg_len + 1 > sizeof(target_path_trial)) {
+            snprintf(response_buffer, response_max_len, "%sCD: Resulting path is too long\n", RESP_ERROR_PREFIX);
+            return;
         }
+        strcpy(target_path_trial, data->current_wd_abs);
+        strcat(target_path_trial, "/");
         strcat(target_path_trial, path_arg);
     }
 
-    if (target_path_trial[0] == '\0' && strcmp(data->server_root_abs, "/") == 0 && strcmp(path_arg, "/") == 0) {
-        // Special case: CD / when root is /
-        strcpy(target_path_trial, "/");
-    }
-
-
     char resolved_path[MAX_PATH_LEN];
-    if (realpath(target_path_trial, resolved_path) == NULL) return;
+    if (realpath(target_path_trial, resolved_path) == NULL) {
+        snprintf(response_buffer, response_max_len, "%sCD: Invalid path or path does not exist: %s\n", RESP_ERROR_PREFIX, path_arg);
+        return;
+    }
 
     struct stat st;
-    if (stat(resolved_path, &st) != 0 || !S_ISDIR(st.st_mode)) return;
-
-    size_t resolved_len = strlen(resolved_path);
-    if (resolved_len < len_current_root || strncmp(resolved_path, data->server_root_abs, len_current_root) != 0) return;
-    if (resolved_len > len_current_root && resolved_path[len_current_root] != '/') {
-        if (strcmp(data->server_root_abs, "/") != 0) return;
+    if (stat(resolved_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        snprintf(response_buffer, response_max_len, "%sCD: Not a directory: %s\n", RESP_ERROR_PREFIX, path_arg);
+        return;
     }
 
-    strncpy(data->current_wd_abs, resolved_path, MAX_PATH_LEN -1);
-    data->current_wd_abs[MAX_PATH_LEN-1] = '\0';
-
-    char rel_path_for_client[MAX_PATH_LEN];
-    if (get_relative_path(data->current_wd_abs, data->server_root_abs, rel_path_for_client, MAX_PATH_LEN)) {
-        char display_path[MAX_PATH_LEN];
-        if (strcmp(rel_path_for_client, "/") == 0) {
-            if (MAX_PATH_LEN > 1) strcpy(display_path, "/"); else display_path[0] = '\0';
-        } else if (rel_path_for_client[0] == '/' && strlen(rel_path_for_client) > 1) {
-            strncpy(display_path, rel_path_for_client + 1, MAX_PATH_LEN -1);
-            display_path[MAX_PATH_LEN-1] = '\0';
-        } else {
-            strncpy(display_path, rel_path_for_client, MAX_PATH_LEN -1);
-            display_path[MAX_PATH_LEN-1] = '\0';
+    size_t root_len = strlen(data->server_root_abs);
+    if (strncmp(resolved_path, data->server_root_abs, root_len) != 0 ||
+        (resolved_path[root_len] != '\0' && resolved_path[root_len] != '/' && root_len > 1)) {
+        snprintf(response_buffer, response_max_len, "%sCD: Operation not permitted (outside root jail)\n", RESP_ERROR_PREFIX);
+    return;
         }
 
-        if (strlen(display_path) + 2 <= response_max_len) {
+        strncpy(data->current_wd_abs, resolved_path, MAX_PATH_LEN -1);
+        data->current_wd_abs[MAX_PATH_LEN-1] = '\0';
+
+        char rel_path_for_client[MAX_PATH_LEN];
+        if (get_relative_path(data->current_wd_abs, data->server_root_abs, rel_path_for_client, MAX_PATH_LEN)) {
+            char display_path[MAX_PATH_LEN];
+            if (strcmp(rel_path_for_client, "/") == 0) {
+                strcpy(display_path, "/");
+            } else if (rel_path_for_client[0] == '/' && strlen(rel_path_for_client) > 1) {
+                strncpy(display_path, rel_path_for_client + 1, sizeof(display_path) - 1);
+                display_path[sizeof(display_path) - 1] = '\0';
+            } else {
+                strncpy(display_path, rel_path_for_client, sizeof(display_path) - 1);
+                display_path[sizeof(display_path) - 1] = '\0';
+            }
             snprintf(response_buffer, response_max_len, "%s\n", display_path);
-        } else if (response_max_len >= 2) {
-            snprintf(response_buffer, response_max_len, "%.*s\n", (int)(response_max_len - 2), display_path);
+        } else {
+            snprintf(response_buffer, response_max_len, "%sCD: Error determining relative path\n", RESP_ERROR_PREFIX);
         }
-    }
 }
 
 /*
  * format_list_item
- * Safely formats a single line for the LIST command output.
+ * Safely formats a single line for the LIST command output by building it incrementally.
  */
 static void format_list_item(char *buffer, size_t buf_size, const char *name, const char *middle, const char *target, const char *suffix) {
     if (buffer == NULL || buf_size == 0) return;
     buffer[0] = '\0';
 
-    char truncated_name[NAME_MAX + 1];
-    strncpy(truncated_name, name, NAME_MAX);
-    truncated_name[NAME_MAX] = '\0';
-
-    const char *actual_middle = middle ? middle : "";
-    const char *actual_suffix = suffix ? suffix : "";
-    const char *actual_target = target ? target : "";
-
-    size_t name_len = strlen(truncated_name);
-    size_t middle_len = strlen(actual_middle);
-    size_t suffix_len = strlen(actual_suffix);
-    size_t target_len = strlen(actual_target);
-
     size_t current_pos = 0;
-    size_t space_needed;
+    int written;
 
-    // Try to append name
-    space_needed = name_len;
-    if (current_pos + space_needed < buf_size) {
-        strcpy(buffer + current_pos, truncated_name);
-        current_pos += space_needed;
-    } else { goto end_format; } // Not enough space even for name
+    // 1. Append name
+    written = snprintf(buffer + current_pos, buf_size - current_pos, "%s", name);
+    if (written < 0 || (size_t)written >= (buf_size - current_pos)) goto end_format;
+    current_pos += written;
 
-    // Try to append middle (only if target is also to be appended)
-    if (middle && target) {
-        space_needed = middle_len;
-        if (current_pos + space_needed < buf_size) {
-            strcpy(buffer + current_pos, actual_middle);
-            current_pos += space_needed;
-        } else { goto append_suffix_only; } // No space for middle, skip target, try suffix
+    // 2. Append middle
+    if (middle) {
+        written = snprintf(buffer + current_pos, buf_size - current_pos, "%s", middle);
+        if (written < 0 || (size_t)written >= (buf_size - current_pos)) goto end_format;
+        current_pos += written;
     }
 
-    // Try to append target (only if middle was appended)
-    if (middle && target) {
-        // Calculate remaining space for target, considering suffix and null terminator
-        size_t space_for_target = 0;
-        if (buf_size > current_pos + suffix_len + 1) { // +1 for null terminator
-            space_for_target = buf_size - current_pos - suffix_len - 1;
-        }
-
-        if (target_len <= space_for_target) {
-            strcpy(buffer + current_pos, actual_target);
-            current_pos += target_len;
-        } else if (space_for_target > 0) { // Truncate target
-            strncpy(buffer + current_pos, actual_target, space_for_target);
-            current_pos += space_for_target;
-            buffer[current_pos] = '\0'; // strncpy might not null terminate
-        }
-        // If no space for target (space_for_target is 0), it's skipped.
+    // 3. Append target
+    if (target) {
+        written = snprintf(buffer + current_pos, buf_size - current_pos, "%s", target);
+        if (written < 0 || (size_t)written >= (buf_size - current_pos)) goto end_format;
+        current_pos += written;
     }
 
-    append_suffix_only:
-    // Try to append suffix
-    space_needed = suffix_len;
-    if (current_pos + space_needed < buf_size) {
-        strcpy(buffer + current_pos, actual_suffix);
-        current_pos += space_needed; // Not strictly needed as it's the last part
-    } else if (buf_size > current_pos && buf_size > 0) {
-        buffer[current_pos] = '\0'; // Ensure null termination if suffix doesn't fit
+    // 4. Append suffix
+    if (suffix) {
+        written = snprintf(buffer + current_pos, buf_size - current_pos, "%s", suffix);
+        if (written < 0 || (size_t)written >= (buf_size - current_pos)) goto end_format;
+        current_pos += written;
     }
 
     end_format:
-    if (buf_size > 0) buffer[buf_size - 1] = '\0'; // Final safety net for null termination
+    if (buf_size > 0) {
+        buffer[buf_size - 1] = '\0';
+    }
 }
-
 
 /*
  * handle_list
@@ -486,133 +467,70 @@ static void handle_list(client_thread_data_t *data, int client_sockfd) {
 
     dirp = opendir(data->current_wd_abs);
     if (dirp == NULL) {
-        char err_msg_strerror[128];
-        strncpy(err_msg_strerror, strerror(errno), sizeof(err_msg_strerror) - 1);
-        err_msg_strerror[sizeof(err_msg_strerror) - 1] = '\0';
-        int fixed_len_err = strlen(RESP_ERROR_PREFIX) + strlen("LIST: Cannot open directory ") + strlen(": ") + strlen("\n") +1;
-        int max_len_for_cwd_err = 0;
-        if (MAX_BUFFER_SIZE > fixed_len_err + strlen(err_msg_strerror)) {
-            max_len_for_cwd_err = MAX_BUFFER_SIZE - (fixed_len_err + strlen(err_msg_strerror));
-        }
-        snprintf(response_line, MAX_BUFFER_SIZE, "%sLIST: Cannot open directory %.*s: %s\n",
-                 RESP_ERROR_PREFIX, max_len_for_cwd_err, data->current_wd_abs, err_msg_strerror);
+        snprintf(response_line, sizeof(response_line), "%sLIST: Cannot open directory: %s\n", RESP_ERROR_PREFIX, strerror(errno));
         send_all(client_sockfd, response_line, strlen(response_line));
         return;
     }
 
     errno = 0;
-    while (1) {
-        entry = readdir(dirp);
-        int readdir_errno_after_call = errno;
-
-        if (entry == NULL) {
-            if (readdir_errno_after_call != 0) {
-                char err_msg_readdir[128];
-                strncpy(err_msg_readdir, strerror(readdir_errno_after_call), sizeof(err_msg_readdir)-1);
-                err_msg_readdir[sizeof(err_msg_readdir)-1] = '\0';
-                size_t err_prefix_len = strlen(RESP_ERROR_PREFIX) + strlen("LIST: Error reading directory contents: ") + strlen("\n") + 1;
-                if (MAX_BUFFER_SIZE > err_prefix_len + strlen(err_msg_readdir)) {
-                    snprintf(response_line, MAX_BUFFER_SIZE, "%sLIST: Error reading directory contents: %s\n", RESP_ERROR_PREFIX, err_msg_readdir);
-                    if (send_all(client_sockfd, response_line, strlen(response_line)) == -1) { /* Log or handle send error */ }
-                }
-            }
-            break;
-        }
-
+    while ((entry = readdir(dirp)) != NULL) {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            errno = 0; continue;
+            continue;
         }
 
-        size_t len_cwd_list = strlen(data->current_wd_abs);
-        size_t len_entry_name = strlen(entry->d_name);
-        size_t required_len;
-        if (strcmp(data->current_wd_abs, "/") == 0) required_len = 1 + len_entry_name + 1;
-        else required_len = len_cwd_list + 1 + len_entry_name + 1;
-
-        if (required_len > sizeof(item_path_abs)) {
-            format_list_item(response_line, MAX_BUFFER_SIZE, entry->d_name, NULL, NULL, " [path too long to stat]\n");
-            if (send_all(client_sockfd, response_line, strlen(response_line)) == -1) goto list_cleanup_and_return;
-            errno = 0; continue;
-        }
+        // Safely construct the absolute path for the directory entry
+        size_t cwd_len = strlen(data->current_wd_abs);
+        size_t name_len = strlen(entry->d_name);
 
         if (strcmp(data->current_wd_abs, "/") == 0) {
-            item_path_abs[0] = '/'; strcpy(item_path_abs + 1, entry->d_name);
+            if (1 + name_len + 1 > sizeof(item_path_abs)) {
+                log_event("Path too long for item: /%s", entry->d_name);
+                continue;
+            }
+            strcpy(item_path_abs, "/");
+            strcat(item_path_abs, entry->d_name);
         } else {
-            strcpy(item_path_abs, data->current_wd_abs); strcat(item_path_abs, "/"); strcat(item_path_abs, entry->d_name);
+            if (cwd_len + 1 + name_len + 1 > sizeof(item_path_abs)) {
+                log_event("Path too long for item: %s/%s", data->current_wd_abs, entry->d_name);
+                continue;
+            }
+            strcpy(item_path_abs, data->current_wd_abs);
+            strcat(item_path_abs, "/");
+            strcat(item_path_abs, entry->d_name);
         }
 
         struct stat st;
-        errno = 0;
         if (lstat(item_path_abs, &st) == -1) {
-            errno = 0; continue;
+            continue;
         }
-        response_line[0] = '\0';
 
         if (S_ISDIR(st.st_mode)) {
-            format_list_item(response_line, MAX_BUFFER_SIZE, entry->d_name, NULL, NULL, "/\n");
+            format_list_item(response_line, sizeof(response_line), entry->d_name, NULL, NULL, "/\n");
         } else if (S_ISLNK(st.st_mode)) {
             char target_buf[MAX_PATH_LEN];
-            errno = 0;
-            ssize_t readlink_len = readlink(item_path_abs, target_buf, sizeof(target_buf) - 1);
-
-            if (readlink_len != -1) {
-                target_buf[readlink_len] = '\0';
-                char first_target_abs_path[MAX_PATH_LEN]; first_target_abs_path[0] = '\0';
-
-                if (target_buf[0] == '/') {
-                    strncpy(first_target_abs_path, target_buf, MAX_PATH_LEN -1); first_target_abs_path[MAX_PATH_LEN-1] = '\0';
-                } else {
-                    char item_path_abs_copy_for_dirname[MAX_PATH_LEN];
-                    strncpy(item_path_abs_copy_for_dirname, item_path_abs, MAX_PATH_LEN-1); item_path_abs_copy_for_dirname[MAX_PATH_LEN-1] = '\0';
-                    char *link_dir = dirname(item_path_abs_copy_for_dirname);
-
-                    if (!link_dir) {
-                        format_list_item(response_line, MAX_BUFFER_SIZE, entry->d_name, " -> ", target_buf, " [error resolving link dir]\n");
-                        goto send_current_item_response;
-                    }
-                    size_t len_link_dir = strlen(link_dir); size_t len_target_direct = strlen(target_buf);
-                    if (len_link_dir + 1 + len_target_direct + 1 > MAX_PATH_LEN) {
-                        format_list_item(response_line, MAX_BUFFER_SIZE, entry->d_name, " -> ", target_buf, " [resolved path too long]\n");
-                        goto send_current_item_response;
-                    }
-                    strcpy(first_target_abs_path, link_dir);
-                    if (strcmp(link_dir, "/") != 0) { // Avoid "//" if link_dir is "/"
-                        if (len_link_dir > 0 && link_dir[len_link_dir - 1] != '/') strcat(first_target_abs_path, "/");
-                    }
-                    // Avoid double slash if first_target_abs_path is "/" and target_buf also starts with "/"
-                    if (first_target_abs_path[strlen(first_target_abs_path)-1] == '/' && target_buf[0] == '/') {
-                        if (strlen(target_buf) > 1) strcat(first_target_abs_path, target_buf + 1);
-                        // else if target_buf is just "/", first_target_abs_path remains "/"
-                    } else if (target_buf[0] != '\0') { // Avoid appending empty target_buf
-                        strcat(first_target_abs_path, target_buf);
-                    }
-                }
-
-                struct stat first_target_st; int is_intermediate_link = 0; errno = 0;
-                if (lstat(first_target_abs_path, &first_target_st) == 0 && S_ISLNK(first_target_st.st_mode)) is_intermediate_link = 1;
-
-                char ultimate_resolved_path_abs[MAX_PATH_LEN]; char display_target_rel[MAX_PATH_LEN]; errno = 0;
-                if (realpath(first_target_abs_path, ultimate_resolved_path_abs) != NULL &&
-                    get_relative_path(ultimate_resolved_path_abs, data->server_root_abs, display_target_rel, MAX_PATH_LEN)) {
-                    if (is_intermediate_link) format_list_item(response_line, MAX_BUFFER_SIZE, entry->d_name, " -->> ", display_target_rel, "\n");
-                    else format_list_item(response_line, MAX_BUFFER_SIZE, entry->d_name, " --> ", display_target_rel, "\n");
-                    } else {
-                        format_list_item(response_line, MAX_BUFFER_SIZE, entry->d_name, " -> ", target_buf, " [unresolved/external]\n");
-                    }
+            ssize_t len = readlink(item_path_abs, target_buf, sizeof(target_buf) - 1);
+            if (len != -1) {
+                target_buf[len] = '\0';
+                format_list_item(response_line, sizeof(response_line), entry->d_name, " -> ", target_buf, "\n");
             } else {
-                format_list_item(response_line, MAX_BUFFER_SIZE, entry->d_name, " -> ", NULL, " [broken link]\n");
+                format_list_item(response_line, sizeof(response_line), entry->d_name, " -> ", "[broken link]", "\n");
             }
         } else {
-            format_list_item(response_line, MAX_BUFFER_SIZE, entry->d_name, NULL, NULL, "\n");
+            format_list_item(response_line, sizeof(response_line), entry->d_name, NULL, NULL, "\n");
         }
 
-        send_current_item_response:
-        if (strlen(response_line) > 0) {
-            if (send_all(client_sockfd, response_line, strlen(response_line)) == -1) goto list_cleanup_and_return;
+        if (send_all(client_sockfd, response_line, strlen(response_line)) == -1) {
+            break;
         }
         errno = 0;
     }
 
-    list_cleanup_and_return:
-    if (closedir(dirp) == -1) perror("closedir in handle_list");
+    if (errno != 0 && entry == NULL) {
+        snprintf(response_line, sizeof(response_line), "%sLIST: Error reading directory: %s\n", RESP_ERROR_PREFIX, strerror(errno));
+        send_all(client_sockfd, response_line, strlen(response_line));
+    }
+
+    if (closedir(dirp) == -1) {
+        perror("closedir in handle_list");
+    }
 }
