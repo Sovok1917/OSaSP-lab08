@@ -89,10 +89,3 @@ force_clean:
 	@# We don't remove the BUILD_DIR itself here, just its contents
 	@# because mkdir -p $(BUILD_DIR) will be called again.
 	@echo "Forced clean complete."
-
-
-# Ensure build directory exists for objects (less critical now with MODE_FLAG_FILE handling mkdir)
-# $(SERVER_OBJS): | $(BUILD_DIR)
-# $(CLIENT_OBJS): | $(BUILD_DIR)
-# $(BUILD_DIR):
-#	mkdir -p $(BUILD_DIR)

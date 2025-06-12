@@ -1,8 +1,10 @@
 /*
- * client.c
- * Implements a TCP client that interacts with a server using a simple text-based protocol.
- * It supports interactive command input from the user and batch processing of commands
- * from a specified file using the '@filename' syntax.
+ * src/client.c
+ *
+ * This file implements the TCP client application. It connects to the server,
+ * handles user input for interactive sessions, processes client-side commands
+ * like LCD, and sends all other commands to the server for execution, including
+ * server-side script requests using the '@' syntax.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
@@ -19,44 +21,42 @@
 #include "common.h"
 #include "protocol.h"
 
-// --- Global variables for graceful shutdown ---
+// Global flag for handling graceful shutdown on signals.
 static volatile sig_atomic_t g_shutdown_flag = 0;
-// ---
 
-// Function prototypes
-static void process_commands_from_file(FILE *file, int sockfd, char *current_prompt_dir);
+// Function Prototypes
 static void interactive_mode(int sockfd, char *current_prompt_dir);
 static void update_prompt_dir(const char *server_response, char *current_prompt_dir, size_t prompt_dir_size);
 static void signal_handler(int signum);
 
 /*
- * main
- * Entry point for the client application.
- * Parses command-line arguments for server address and port number,
- * connects to the server, and enters interactive command processing mode.
+ * Purpose:
+ *   The main entry point for the client application. It parses command-line
+ *   arguments, establishes a connection to the server, and enters either an
+ *   interactive loop or a non-interactive mode to execute a single command
+ *   (like a server-side script) and then exit.
  *
  * Parameters:
- *   argc: int - The number of command-line arguments.
- *   argv: char*[] - Array of command-line argument strings.
- *                   Expected: ./myclient <server_address> <port_number>
+ *   argc: The number of command-line arguments.
+ *   argv: An array of command-line argument strings. The expected usage is:
+ *         ./myclient <server_address> <port_number> [@batch_file_on_server]
  *
  * Returns:
- *   int - 0 on successful completion, 1 on error.
+ *   0 on successful completion, and 1 on error.
  */
 int main(int argc, char *argv[]) {
     initialize_static_memory();
 
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <server_address> <port_number>\n", argv[0]);
+    if (argc < 3 || argc > 4) {
+        fprintf(stderr, "Usage: %s <server_address> <port_number> [@batch_file_on_server]\n", argv[0]);
         return 1;
     }
 
-    // --- Setup Signal Handlers ---
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0; // Do not restart syscalls like fgets()
+    sa.sa_flags = 0;
 
     if (sigaction(SIGINT, &sa, NULL) == -1) {
         perror("sigaction for SIGINT failed");
@@ -66,7 +66,6 @@ int main(int argc, char *argv[]) {
         perror("sigaction for SIGTERM failed");
         return 1;
     }
-    // ---
 
     const char *server_ip = argv[1];
     char *endptr;
@@ -77,21 +76,18 @@ int main(int argc, char *argv[]) {
     }
     uint16_t port = (uint16_t)port_long;
 
-    int sockfd;
-    struct sockaddr_in server_addr;
-
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd == -1) {
         perror("socket creation failed");
         return 1;
     }
 
+    struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
     if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0) {
         perror("inet_pton failed for server address");
-        fprintf(stderr, "Invalid server address: %s\n", server_ip);
         close(sockfd);
         return 1;
     }
@@ -115,7 +111,7 @@ int main(int argc, char *argv[]) {
     int welcome_received_complete = 0;
     while ((nbytes = recv_line(sockfd, buffer, MAX_BUFFER_SIZE)) > 0) {
         printf("%s", buffer);
-        if (strstr(buffer, "Developer:") != NULL) { // Heuristic end of welcome message
+        if (strstr(buffer, "Developer:") != NULL) {
             welcome_received_complete = 1;
             break;
         }
@@ -128,7 +124,26 @@ int main(int argc, char *argv[]) {
 
     char current_prompt_dir[MAX_PATH_LEN] = "";
 
-    interactive_mode(sockfd, current_prompt_dir);
+    if (argc == 4) { // Non-interactive mode
+        const char* command_arg = argv[3];
+        if (command_arg[0] != '@') {
+            fprintf(stderr, "Error: Invalid fourth argument. Must be of the form @filename\n");
+            close(sockfd);
+            return 1;
+        }
+        printf("> %s\n", command_arg);
+        char command_to_send[MAX_BUFFER_SIZE];
+        snprintf(command_to_send, sizeof(command_to_send), "%s\n", command_arg);
+        if (send_all(sockfd, command_to_send, strlen(command_to_send)) == -1) {
+            fprintf(stderr, "Error sending command to server.\n");
+        } else {
+            while ((nbytes = recv_line(sockfd, buffer, MAX_BUFFER_SIZE)) > 0) {
+                printf("%s", buffer);
+            }
+        }
+    } else { // Interactive mode
+        interactive_mode(sockfd, current_prompt_dir);
+    }
 
     if (g_shutdown_flag) {
         fprintf(stdout, "\nShutdown signal caught. Notifying server...\n");
@@ -146,8 +161,15 @@ int main(int argc, char *argv[]) {
 }
 
 /*
- * signal_handler
- * Catches SIGINT and SIGTERM to allow for a graceful shutdown.
+ * Purpose:
+ *   A signal handler that catches SIGINT and SIGTERM to set a global flag,
+ *   allowing the main loops to terminate gracefully.
+ *
+ * Parameters:
+ *   signum: The signal number that was caught.
+ *
+ * Returns:
+ *   void
  */
 static void signal_handler(int signum) {
     if (signum == SIGINT || signum == SIGTERM) {
@@ -156,92 +178,44 @@ static void signal_handler(int signum) {
 }
 
 /*
- * update_prompt_dir
- * Updates the client's current directory string for the command prompt.
+ * Purpose:
+ *   Updates the client's command prompt string based on the server's response
+ *   to a successful CD command.
+ *
+ * Parameters:
+ *   server_response: The raw response line from the server.
+ *   current_prompt_dir: The buffer to update with the new directory name for the prompt.
+ *   prompt_dir_size: The size of the current_prompt_dir buffer.
+ *
+ * Returns:
+ *   void
  */
 static void update_prompt_dir(const char *server_response, char *current_prompt_dir, size_t prompt_dir_size) {
     if (current_prompt_dir == NULL || prompt_dir_size == 0) return;
 
     char clean_response[MAX_PATH_LEN];
-    strncpy(clean_response, server_response, MAX_PATH_LEN -1);
-    clean_response[MAX_PATH_LEN-1] = '\0';
+    snprintf(clean_response, sizeof(clean_response), "%s", server_response);
     clean_response[strcspn(clean_response, "\r\n")] = 0;
 
     if (strlen(clean_response) == 0 || strcmp(clean_response, "/") == 0) {
         if (prompt_dir_size > 0) current_prompt_dir[0] = '\0';
     } else {
-        strncpy(current_prompt_dir, clean_response, prompt_dir_size - 1);
-        current_prompt_dir[prompt_dir_size - 1] = '\0';
+        snprintf(current_prompt_dir, prompt_dir_size, "%s", clean_response);
     }
 }
 
 /*
- * process_commands_from_file
- * Reads commands from a file, sends them to the server, and prints responses.
- */
-static void process_commands_from_file(FILE *file, int sockfd, char *current_prompt_dir) {
-    char line_buffer[MAX_BUFFER_SIZE];
-    char response_buffer[MAX_BUFFER_SIZE];
-    ssize_t nbytes_recv;
-    int line_count = 0;
-
-    while (!g_shutdown_flag && fgets(line_buffer, sizeof(line_buffer), file) != NULL) {
-        line_count++;
-        line_buffer[strcspn(line_buffer, "\r\n")] = 0;
-
-        if (strlen(line_buffer) == 0 && !feof(file)) continue;
-
-        if (strlen(current_prompt_dir) == 0) printf("> %s\n", line_buffer);
-        else printf("%s> %s\n", current_prompt_dir, line_buffer);
-        fflush(stdout);
-
-        if (send_all(sockfd, line_buffer, strlen(line_buffer)) == -1 || send_all(sockfd, "\n", 1) == -1) {
-            fprintf(stderr, "Error sending command/newline from file (line %d): %s\n", line_count, line_buffer);
-            break;
-        }
-
-        char temp_cmd_check[MAX_CMD_LEN];
-        sscanf(line_buffer, "%s", temp_cmd_check);
-        if (strcmp(temp_cmd_check, CMD_QUIT) == 0) {
-            if ((nbytes_recv = recv_line(sockfd, response_buffer, MAX_BUFFER_SIZE)) > 0) {
-                printf("%s", response_buffer);
-            }
-            break;
-        }
-
-        int is_cd_command = (strncmp(line_buffer, CMD_CD, strlen(CMD_CD)) == 0);
-        int first_line_after_cd = 1;
-
-        while ((nbytes_recv = recv_line(sockfd, response_buffer, MAX_BUFFER_SIZE)) > 0) {
-            printf("%s", response_buffer);
-            if (is_cd_command && first_line_after_cd) {
-                if (strncmp(response_buffer, RESP_ERROR_PREFIX, strlen(RESP_ERROR_PREFIX)) != 0) {
-                    update_prompt_dir(response_buffer, current_prompt_dir, MAX_PATH_LEN);
-                }
-                first_line_after_cd = 0;
-            }
-        }
-        if (nbytes_recv == 0) {
-            fprintf(stderr, "Server closed connection unexpectedly (file processing line %d).\n", line_count);
-            break;
-        } else if (nbytes_recv == -1) {
-            fprintf(stderr, "Error receiving response from server (file processing line %d).\n", line_count);
-            break;
-        }
-        fflush(stdout);
-    }
-    if (ferror(file)) {
-        perror("Error reading from command file");
-    }
-    if (g_shutdown_flag) {
-        fprintf(stderr, "\nShutdown signal received during file processing. Aborting.\n");
-    }
-}
-
-/*
- * interactive_mode
- * Handles interactive command input from the user via stdin.
- * Also handles in-session batch file execution via the '@filename' command.
+ * Purpose:
+ *   Manages the main interactive loop for the client. It displays a prompt,
+ *   reads user input, handles client-side commands (like LCD), and sends all
+ *   other commands to the server for processing.
+ *
+ * Parameters:
+ *   sockfd: The file descriptor for the connected server socket.
+ *   current_prompt_dir: A buffer containing the string for the current server directory prompt.
+ *
+ * Returns:
+ *   void
  */
 static void interactive_mode(int sockfd, char *current_prompt_dir) {
     char command_buffer[MAX_BUFFER_SIZE];
@@ -254,13 +228,10 @@ static void interactive_mode(int sockfd, char *current_prompt_dir) {
         fflush(stdout);
 
         if (fgets(command_buffer, sizeof(command_buffer), stdin) == NULL) {
-            if (g_shutdown_flag) {
-                break;
-            }
+            if (g_shutdown_flag) break;
             if (feof(stdin)) {
                 printf("\nEOF detected on stdin. Sending QUIT command.\n");
-                strncpy(command_buffer, CMD_QUIT, sizeof(command_buffer) -1);
-                command_buffer[sizeof(command_buffer)-1] = '\0';
+                snprintf(command_buffer, sizeof(command_buffer), "%s", CMD_QUIT);
             } else if (errno == EINTR) {
                 clearerr(stdin);
                 continue;
@@ -273,30 +244,25 @@ static void interactive_mode(int sockfd, char *current_prompt_dir) {
         command_buffer[strcspn(command_buffer, "\r\n")] = 0;
         if (strlen(command_buffer) == 0 && !feof(stdin)) continue;
 
-        // Check for batch file command
-        if (command_buffer[0] == '@') {
-            if (strlen(command_buffer) <= 1) {
-                fprintf(stderr, "Error: Filename missing after '@'.\n");
-                continue;
+        if (strncmp(command_buffer, "LCD ", 4) == 0) {
+            const char *path = command_buffer + 4;
+            if (strlen(path) == 0) {
+                fprintf(stderr, "Usage: LCD <local_directory>\n");
+            } else {
+                if (chdir(path) == -1) {
+                    perror("LCD command failed");
+                } else {
+                    char cwd_buf[MAX_PATH_LEN];
+                    if (getcwd(cwd_buf, sizeof(cwd_buf)) != NULL) {
+                        printf("Local directory changed to: %s\n", cwd_buf);
+                    } else {
+                        perror("getcwd failed after LCD");
+                    }
+                }
             }
-            const char *filename = command_buffer + 1;
-            FILE *batch_file = fopen(filename, "r");
-            if (batch_file == NULL) {
-                perror("Error opening batch file");
-                fprintf(stderr, "Failed to open: %s\n", filename);
-                continue;
-            }
-
-            printf("--- Executing commands from '%s' ---\n", filename);
-            process_commands_from_file(batch_file, sockfd, current_prompt_dir);
-            if (fclose(batch_file) == EOF) {
-                perror("fclose batch_file failed");
-            }
-            printf("--- Finished executing '%s' ---\n", filename);
-            continue; // Go back to prompt
+            continue;
         }
 
-        // Regular command processing
         if (send_all(sockfd, command_buffer, strlen(command_buffer)) == -1 || send_all(sockfd, "\n", 1) == -1) {
             fprintf(stderr, "Error sending command/newline: %s\n", command_buffer);
             break;
@@ -327,7 +293,7 @@ static void interactive_mode(int sockfd, char *current_prompt_dir) {
         if (nbytes_recv == 0) {
             fprintf(stderr, "\nServer closed connection unexpectedly.\n");
             break;
-        } else if (nbytes_recv == -1) {
+        } else if (nbytes_recv == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
             fprintf(stderr, "\nError receiving response from server.\n");
             break;
         }

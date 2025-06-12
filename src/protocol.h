@@ -1,6 +1,10 @@
 /*
- * protocol.h
- * Defines constants and protocol-specific elements for the client-server application.
+ * src/protocol.h
+ *
+ * This header file defines constants and protocol-specific elements that are
+ * shared between the client and server applications. This includes buffer sizes,
+ * command strings, and response prefixes to ensure both applications adhere to
+ * the same communication standard.
  */
 #ifndef PROTOCOL_H
 #define PROTOCOL_H
@@ -10,7 +14,7 @@
 #define MAX_CMD_LEN 256
 #define MAX_ARGS_LEN (MAX_BUFFER_SIZE - MAX_CMD_LEN - 5) // For ECHO command argument
 
-#define SERVER_DEFAULT_WELCOME_MSG "Welcome to the test server \'myserver\'\n"
+#define SERVER_DEFAULT_WELCOME_MSG "Welcome to the test server 'myserver'"
 
 // Client receive timeout in milliseconds for multi-line responses
 #define CLIENT_RECV_TIMEOUT_MS 200
